@@ -43,6 +43,8 @@ import {
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { runCommand } from "./commands.ts";
+import { LaunchBudget, type LaunchKind, type LaunchTicket } from "./launch-budget.ts";
+import { classifyError } from "./drivers/retry.ts";
 import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest, toolEvidence } from "./digest.ts";
 import { appendDecision, readDecisions, flushDecisionLog } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
@@ -118,6 +120,7 @@ import {
   parseConfigPatch,
   roomTurnTimeoutMinutes,
   maxConcurrentBotThreads,
+  launchLimits,
   saveConfig,
   showToolCallsEnabled,
   skillAuthoringEnabled,
@@ -487,6 +490,26 @@ let companionMutationToken: string | undefined = DESKTOP_MANAGED ? "" : undefine
 // Where remote clients reach this server (a proxy's public address); pairing URLs use it.
 const FALLBACK_PUBLIC_URL = process.env.OMB_PUBLIC_URL?.trim().replace(/\/+$/, "") || null;
 const cfg = loadConfig();
+// Item 0.4: one launch fuse across every bot; limits follow the live config.
+const launchBudget = new LaunchBudget(join(DATA_DIR, "launch-budget.json"), launchLimits(cfg));
+const launchTickets = new Map<string, LaunchTicket>();
+function launchKindFor(opts: { automationSource?: unknown; cardContinuation?: boolean; commsDepth?: number; unattended?: boolean } | undefined): { kind: LaunchKind; attended: boolean } {
+  if (opts?.automationSource === "bench") return { kind: "bench", attended: false };
+  if (opts?.automationSource) return { kind: "routine", attended: false };
+  if ((opts?.commsDepth ?? 0) > 0) return { kind: "peer", attended: false };
+  if (opts?.cardContinuation) return { kind: "wake", attended: false };
+  return { kind: "turn", attended: !opts?.unattended };
+}
+function launchRefusal(decision: { reason: string; retryAfterMs: number }): Error {
+  const why = decision.reason === "concurrent"
+    ? "too many engines are running at once"
+    : decision.reason === "paused"
+      ? "launches are paused after a provider quota error"
+      : `the ${decision.reason} launch cap has been reached`;
+  return Object.assign(new Error(`launch budget: ${why} — try again shortly`), {
+    status: 409, code: "launch_budget", reason: decision.reason, retryAfterMs: decision.retryAfterMs,
+  });
+}
 const customDomainVerifier = createCustomDomainVerifier({ environmentId: ENVIRONMENT_ID });
 // "Sign in with your email" on /pair: the allow-list is read per call so a
 // Settings change or an env bootstrap applies without a restart.
@@ -911,6 +934,11 @@ function claimTurnResource(owner: TurnOwner, resource: string): boolean {
 
 function releaseTurnResources(owner: TurnOwner | undefined): void {
   if (!owner) return;
+  const ticket = launchTickets.get(`${owner.threadId}:${owner.generation}`);
+  if (ticket) {
+    launchBudget.release(ticket);
+    launchTickets.delete(`${owner.threadId}:${owner.generation}`);
+  }
   if (settlingResourceOwners.get(owner.threadId) === owner.generation) settlingResourceOwners.delete(owner.threadId);
   turnResources.release(owner);
   if (turnResourceOwners.get(owner.threadId)?.generation === owner.generation) turnResourceOwners.delete(owner.threadId);
@@ -3363,6 +3391,8 @@ bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "turn.completed" || event.type === "session.exited") {
     runningTurnEngines.delete(event.threadId);
     memoryRowsByThread.set(event.threadId, endMemoryTurn(event.threadId));
+    // the launch this thread held is over, for every engine (item 0.4)
+    launchBudget.releaseThread(event.threadId);
   }
 });
 
@@ -4284,6 +4314,8 @@ bus.subscribe((event: RuntimeEvent) => {
         kind: "activity",
         tool: { name: `error: ${event.message.slice(0, 160)}`, ok: false, setup: event.setup, ...(event.terminal ? { terminal: true } : {}) },
       });
+      // out of quota: hold unattended launches for a while (item 0.4)
+      if (classifyError({ text: event.message }).reason === "quota") launchBudget.noteQuotaError();
       // a setup error means the engine could not even start: the bot is
       // dead until something changes, not merely idle. The next successful
       // dispatch moves it to working; turn.completed (which follows a setup
@@ -5264,6 +5296,10 @@ async function startTurn(
   if (botAtThreadCapacity(botId)) {
     throw Object.assign(new Error(`this bot has reached its limit of ${maxConcurrentBotThreads(cfg)} parallel threads — wait for one to finish`), { status: 409, code: "thread_limit" });
   }
+  launchBudget.setLimits(launchLimits(cfg));
+  const launchRequest = { ...launchKindFor(opts), botId, threadId };
+  const launchAdmission = launchBudget.peek(launchRequest);
+  if (!launchAdmission.ok) throw launchRefusal(launchAdmission);
   // Steering is never a cancel. A message sent while teammates are working
   // runs now, with their assignments still attached: they keep running and
   // their results still return here (outstandingAssignmentsPrompt tells this
@@ -5456,6 +5492,14 @@ async function startTurn(
   // hang the HTTP request
   const dispatchClaimId = randomUUID();
   const resourceOwner = { threadId, generation: dispatchClaimId };
+  // a person's own turn is outside the budget entirely: it neither takes a
+  // slot (a turn parked on an approval card is not autonomous work) nor is
+  // refused; every unattended launch is counted and capped
+  if (!launchRequest.attended) {
+    const launch = launchBudget.acquire(launchRequest);
+    if (!launch.ok) throw launchRefusal(launch);
+    launchTickets.set(`${threadId}:${dispatchClaimId}`, launch.ticket);
+  }
   turnResourceOwners.set(threadId, resourceOwner);
   directTurnGenerationByThread.set(threadId, dispatchClaimId);
   if (opts?.coordination) directCoordinationSettlers.set(dispatchClaimId, opts.coordination.settle);
@@ -7148,6 +7192,29 @@ async function runGroupMemberTurn(
   }
   const internalGeneration = beginInternalCapabilityGeneration(threadId);
   const resourceOwner = { threadId, generation: internalGeneration };
+  // the launch budget (item 0.4): a room turn counts like any other launch;
+  // a refusal is a skipped round, the same shape as a busy member
+  launchBudget.setLimits(launchLimits(cfg));
+  const launch = hop > 0
+    ? launchBudget.acquire({ kind: "peer", botId: bot.id, threadId })
+    : ({ ok: true, ticket: null } as const);
+  if (!launch.ok) {
+    revokeInternalCapabilityGeneration(threadId, internalGeneration);
+    if (orchestration) {
+      orchestration.result.outcome = "busy";
+      return true;
+    }
+    const message = `${bot.name} could not start — ${launchRefusal(launch).message}`;
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: message, ok: false },
+    });
+    onDispatchError?.(message);
+    return true;
+  }
+  if (launch.ticket) launchTickets.set(`${threadId}:${internalGeneration}`, launch.ticket);
   turnResourceOwners.set(threadId, resourceOwner);
   let roomVmTarget: ReturnType<typeof localVmTargetForBot> | null = null;
   let retainRoomVmLease = false;
@@ -15487,6 +15554,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
 
     // ── app config (API keys — never echoed back, booleans only) ──
+    if (method === "GET" && path === "/api/launch-budget") {
+      launchBudget.setLimits(launchLimits(cfg));
+      return json(res, 200, launchBudget.snapshot());
+    }
     if (method === "GET" && path === "/api/config") {
       return json(res, 200, configForAccess(configStatus(), auth.scopes.includes("admin")));
     }
@@ -16312,7 +16383,13 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     return json(res, 404, { error: `no route: ${method} ${path}` });
   } catch (e) {
     const status = (e as any)?.status ?? 500;
-    return json(res, status, { error: e instanceof Error ? e.message : String(e) });
+    const typed = e as { code?: unknown; reason?: unknown; retryAfterMs?: unknown } | null;
+    return json(res, status, {
+      error: e instanceof Error ? e.message : String(e),
+      ...(typeof typed?.code === "string" ? { code: typed.code } : {}),
+      ...(typeof typed?.reason === "string" ? { reason: typed.reason } : {}),
+      ...(typeof typed?.retryAfterMs === "number" ? { retryAfterMs: typed.retryAfterMs } : {}),
+    });
   } finally {
     releaseWorkspaceRequest?.();
   }

@@ -377,8 +377,12 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
    where `FAKE_CLAUDE_*` emits a hook call.
 4. `PreCompact` / `SessionStart(compact)` / `Stop` hooks: compaction recorded as transcript
    chips, the last two digests re-sent as plain-text context after it (see F2).
-5. `launch-budget.ts` wired into `spawnCli` callers; settings numbers; typed denial; tests for the
-   pure decision function and for "routine parks, does not fail".
+5. `launch-budget.ts` at turn admission (unattended launches only: routines, wakes, peers,
+   benches — a person's own turn is never held or counted, because a chat full of parked
+   approvals is not autonomous work) plus a blunt process fuse in `spawnCli`; tickets expire
+   after a bounded turn lifetime and are released on any terminal event, so a dispatch that
+   dies mid-setup cannot starve the cap; typed `launch_budget` refusal that routines park on;
+   `GET /api/launch-budget`; config `launches.{maxConcurrent,maxPerHour,maxPerDay}`.
 6. `metrics.ts`: prompt-shape event + ledger field, cache-hit share, tokens per task, CSV export,
    sidebar tooltip.
 7. Replay by bytes with digests; `compaction` message kind and manual compact route (0.7).
