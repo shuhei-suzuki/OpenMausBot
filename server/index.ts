@@ -42,6 +42,8 @@ import {
   type BrowserCleanupWireRequest,
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
+import { runCommand } from "./commands.ts";
+import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest } from "./digest.ts";
 import { appendDecision, readDecisions, flushDecisionLog } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import {
@@ -3336,13 +3338,83 @@ bus.subscribe((event: RuntimeEvent) => {
 // settles — session.exited too, because a turn that died may still have
 // written. Fire-and-forget by construction: endMemoryTurn swallows its own
 // failures and never reaches the fold below.
+// The rows are kept for the digest the fold writes at settle (registration
+// order: this subscriber runs before the fold, so the stash is ready).
+const memoryRowsByThread = new Map<string, MemoryJournalEntry[]>();
 bus.subscribe((event: RuntimeEvent) => {
   if (shouldIgnoreProviderEvent(event)) return;
   if (event.type === "turn.completed" || event.type === "session.exited") {
     runningTurnEngines.delete(event.threadId);
-    endMemoryTurn(event.threadId);
+    memoryRowsByThread.set(event.threadId, endMemoryTurn(event.threadId));
   }
 });
+
+// Per-thread state the digest needs from before the turn: when it started,
+// and the checkpoint taken at dispatch (hash + folder) so settle can diff.
+const turnStartedAt = new Map<string, number>();
+const turnCheckpoints = new Map<string, { cwd: string; hash: string }>();
+// The turn a thread is in, from the last event that named one. Not every
+// driver stamps every item with a turnId (ACP fakes, some ACP agents), and
+// a digest can only count activity it can attribute — so an unstamped tool
+// row is attributed to the thread's live turn instead of to nothing.
+const liveTurnByThread = new Map<string, string>();
+
+/** Write the turn's work digest (item 0.1). Runs off the fold's critical
+ * path because the file diff shells out to git; the receipt keyed on the
+ * turn makes a duplicate settle event harmless. Never throws. */
+function scheduleTurnDigest(input: {
+  botId: string;
+  botName: string;
+  threadId: string;
+  turnId: string;
+  driverKind: string | undefined;
+  reply: string;
+  usage?: { input: number; output: number; cachedInput?: number; costUsd?: number | null };
+}): void {
+  const at = Date.now();
+  const startedAt = turnStartedAt.get(input.threadId);
+  turnStartedAt.delete(input.threadId);
+  const checkpoint = turnCheckpoints.get(input.threadId);
+  turnCheckpoints.delete(input.threadId);
+  const memory = memoryRowsByThread.get(input.threadId) ?? [];
+  memoryRowsByThread.delete(input.threadId);
+  void (async () => {
+    try {
+      let files: Awaited<ReturnType<typeof checkpoints.diffStat>> = null;
+      if (checkpoint) {
+        const after = await checkpoints.snapshot(input.botId, checkpoint.cwd, `settle ${input.threadId.slice(0, 8)}`);
+        if (after) files = await checkpoints.diffStat(input.botId, checkpoint.cwd, checkpoint.hash, after);
+        if (after && !files && checkpoint.hash === after) files = { changed: [], added: [], deleted: [] };
+      }
+      const activities = store.messagesFor(input.threadId);
+      const digest = buildTurnDigest({
+        turnId: input.turnId,
+        botId: input.botId,
+        threadId: input.threadId,
+        at,
+        durationMs: startedAt ? Math.max(0, at - startedAt) : 0,
+        activities,
+        memory,
+        ...(files ? { files } : {}),
+        reply: input.reply,
+        ...(input.usage ? { usage: input.usage } : {}),
+        hookCoverage: coverageForDriver(input.driverKind),
+      });
+      runCommand({ kind: "digest.append", key: `${input.threadId}:${input.turnId}` }, () => {
+        const message = store.appendMessage(input.threadId, {
+          role: "bot",
+          kind: "digest",
+          text: renderDigest(digest),
+          digest,
+          turnId: input.turnId,
+        });
+        return message.id;
+      });
+    } catch (error) {
+      console.error(`digest: could not record turn ${input.turnId} on ${input.threadId}:`, error instanceof Error ? error.message : error);
+    }
+  })();
+}
 
 // Bots currently working with nobody at the keyboard — a webhook turn, or a
 // turn a webhook-driven bot handed to a teammate. Auto mode is a decision
@@ -3859,7 +3931,12 @@ bus.subscribe((event: RuntimeEvent) => {
     lastReply.set(event.threadId, coordinatorVisibleText);
   }
 
+  if (event.turnId) liveTurnByThread.set(event.threadId, event.turnId);
+  const liveTurnId = event.turnId ?? liveTurnByThread.get(event.threadId);
   switch (event.type) {
+    case "turn.started":
+      turnStartedAt.set(event.threadId, Date.now());
+      break;
     case "session.started":
       if (bot && event.sessionId && event.providerInstanceId) {
         store.setResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
@@ -3933,6 +4010,8 @@ bus.subscribe((event: RuntimeEvent) => {
           role: "bot",
           kind: "activity",
           tool: { name, spoken: narrateTool(name) ?? undefined, summary: event.summary, input: event.input },
+          // attributed to its turn so the digest can count it
+          turnId: liveTurnId,
         });
         if (event.itemId) toolMessageByItem.set(`${event.threadId}:${event.itemId}`, message.id);
       }
@@ -4245,6 +4324,18 @@ bus.subscribe((event: RuntimeEvent) => {
               : turnTriggers.get(event.threadId) ?? { kind: "owner" },
         });
         noteSpend(DATA_DIR, event.cost ?? null);
+        if (completedTurnId) {
+          scheduleTurnDigest({
+            botId: bot.id,
+            botName: bot.name,
+            threadId: event.threadId,
+            turnId: completedTurnId,
+            driverKind: registry.get(selection.instanceId)?.driverKind,
+            reply,
+            ...(tokens ? { usage: { input: tokens.input ?? 0, output: tokens.output ?? 0, ...(typeof tokens.cachedInput === "number" ? { cachedInput: tokens.cachedInput } : {}), costUsd: event.cost ?? null } } : {}),
+          });
+        }
+        liveTurnByThread.delete(event.threadId);
         const routineReportThread = routineRun ? routineSourceThread(routineRun) : null;
         // A routine's result belongs to its reporting thread's unread state.
         // Its internal execution should not light up the sidebar as well.
@@ -5203,12 +5294,15 @@ async function startTurn(
   // Resolve its quote from full storage, while the replay itself remains
   // strictly limited to the selected branch below.
   const messagesById = new Map(store.messagesFor(threadId).map((message) => [message.id, message]));
+  // digests ride along: a rebuilt context carries what earlier turns DID,
+  // not only what was said (item 0.1)
   const transcript = activeMessages
-    .filter((m) => ((m.kind === "text" && m.text) || m.roomRequest?.phase === "result") && !skipTranscript.has(m.id))
+    .filter((m) => ((m.kind === "text" && m.text) || (m.kind === "digest" && m.digest) || m.roomRequest?.phase === "result") && !skipTranscript.has(m.id))
     .slice(-40)
     .map((m) => ({
       role: m.role === "user" ? ("user" as const) : ("assistant" as const),
       text: m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
+        : m.kind === "digest" && m.digest ? digestPromptLine(m.digest, bot.name)
         : transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
     }));
 
@@ -5657,7 +5751,11 @@ async function startTurn(
       // the engine cannot edit the project until the snapshot has settled.
       // snapshot() absorbs failures, so checkpointing may delay but never fail
       // a turn.
-      if (checkpointCwd) await checkpoints.snapshot(bot.id, checkpointCwd, `turn ${threadId.slice(0, 8)}`);
+      if (checkpointCwd) {
+        const before = await checkpoints.snapshot(bot.id, checkpointCwd, `turn ${threadId.slice(0, 8)}`);
+        if (before) turnCheckpoints.set(threadId, { cwd: checkpointCwd, hash: before });
+        else turnCheckpoints.delete(threadId);
+      }
       if (!directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId)) {
         throw new DirectTurnSetupCancelled("turn stopped before dispatch");
       }
@@ -6831,9 +6929,12 @@ function serializeRoomContext(
   const messages = store.messagesFor(threadId);
   const messagesById = new Map(messages.map((message) => [message.id, message]));
   return messages
-    .filter((m) => (m.kind === "text" && m.text) || m.roomRequest?.phase === "result")
+    .filter((m) => (m.kind === "text" && m.text) || (m.kind === "digest" && m.digest) || m.roomRequest?.phase === "result")
     .slice(-GROUP_CONTEXT_MESSAGES)
     .map((m) => {
+      if (m.kind === "digest" && m.digest) {
+        return digestPromptLine(m.digest, m.from ? peerName(m.from.name) : "a bot");
+      }
       if (m.roomRequest?.phase === "result") {
         // Keep the chat receipt small without erasing the report from later
         // turns. Resolve from the existing bounded store and recheck access.

@@ -27,6 +27,7 @@ import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { RoutineRunCardData } from "../shared/routine-run.ts";
 import type { SkillRequestCardData } from "../shared/skill-request.ts";
 import type { GroupGoalRunCardData } from "../shared/group-goal-run.ts";
+import type { TurnDigest } from "./digest.ts";
 
 export type MausColor =
   | "green"
@@ -131,8 +132,11 @@ export interface Message {
   roomRequest?: { id: string; phase: "request" | "result" };
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run" | "digest";
   text?: string;
+  /** digest messages: the structured record of what the turn did; `text`
+   * carries its rendering so FTS and replays need no special case. */
+  digest?: TurnDigest;
   /** Durable provider output stored by the harness. Paths always point into
    * OpenMausBot's private attachment directory; renderers receive only the
    * existing allowlisted /api/attachments URL. */

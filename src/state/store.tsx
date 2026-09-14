@@ -133,8 +133,19 @@ export interface SecretRequestCardData {
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run" | "digest";
   text?: string;
+  /** digest messages: what the turn did, rendered in `text` and structured here. */
+  digest?: {
+    turnId: string;
+    durationMs: number;
+    tools: Array<{ name: string; count: number; failed: number; sample?: string }>;
+    toolsDropped?: number;
+    files?: { changed: string[]; added: string[]; deleted: string[]; truncated?: number };
+    memory: Array<{ path: string; kind: "created" | "updated" | "deleted" }>;
+    reply: string;
+    hookCoverage: "full" | "preview" | "none";
+  };
   /** Provider-generated files attached to this assistant response. */
   attachments?: Array<{ kind: "image"; path: string; mime: string }>;
   card?: OptionCardData;

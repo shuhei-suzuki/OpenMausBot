@@ -78,3 +78,32 @@ describe("runCommand", () => {
     expect(commandReceipt("launch.acquire", "ticket-9")).toMatchObject({ kind: "launch.acquire", key: "ticket-9", result: { slot: 3 } });
   });
 });
+
+describe("runCommand nesting", () => {
+  beforeEach(() => {
+    closeMessageDb();
+    rmSync(DATA_DIR, { recursive: true, force: true });
+    mkdirSync(DATA_DIR, { recursive: true });
+  });
+
+  it("lets apply use the store's own transactional writes and keeps them atomic with the receipt", async () => {
+    const { appendMessage } = await import("./message-db.ts");
+    // appendMessage opens its own transaction; inside a command it must join
+    // the command's transaction instead of failing with "nested transaction".
+    runCommand({ kind: "digest.append", key: "t9:turn-1" }, () => {
+      appendMessage("t9", msg("d1", "[digest] one"));
+      return "ok";
+    });
+    expect(readThread("t9", "/nonexistent").messages.map((m) => m.text)).toEqual(["[digest] one"]);
+    expect(commandReceipt("digest.append", "t9:turn-1")).not.toBeNull();
+    // and a failure after the nested write rolls back the write too
+    expect(() =>
+      runCommand({ kind: "digest.append", key: "t9:turn-2" }, () => {
+        appendMessage("t9", msg("d2", "[digest] two"));
+        throw new Error("late failure");
+      }),
+    ).toThrow("late failure");
+    expect(readThread("t9", "/nonexistent").messages.map((m) => m.text)).toEqual(["[digest] one"]);
+    expect(commandReceipt("digest.append", "t9:turn-2")).toBeNull();
+  });
+});
