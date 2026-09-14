@@ -2,7 +2,7 @@
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join } from "node:path";
 
@@ -43,7 +43,7 @@ import {
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { runCommand } from "./commands.ts";
-import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest } from "./digest.ts";
+import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest, toolEvidence } from "./digest.ts";
 import { appendDecision, readDecisions, flushDecisionLog } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import {
@@ -653,7 +653,7 @@ type InternalCapability = {
   threadId: string;
   generation: string;
   depth: number;
-  kind: "agents" | "connectors" | "computer" | "browser";
+  kind: "agents" | "connectors" | "computer" | "browser" | "hooks";
   skillAuthoring: boolean;
   createdBots: number;
   createdRooms?: number;
@@ -841,6 +841,23 @@ function agentsIntegration(
   };
 }
 
+
+/** Engine lifecycle hooks (item 0.2): a turn-scoped bearer the engine's hook
+ * helper presents on /api/internal/hook. OMB_HOOKS=0 turns the channel off. */
+const hooksEnabled = () => process.env.OMB_HOOKS !== "0";
+function hooksIntegration(botId: string, threadId: string, generation: string): { url: string; token: string } {
+  const token = mintInternalCapability({
+    botId,
+    threadId,
+    generation,
+    depth: 0,
+    kind: "hooks",
+    skillAuthoring: false,
+    createdBots: 0,
+    openedThreads: 0,
+  });
+  return { url: `http://127.0.0.1:${PORT}`, token };
+}
 
 type DirectTurnDispatchClaim = {
   id: string;
@@ -3359,6 +3376,44 @@ const turnCheckpoints = new Map<string, { cwd: string; hash: string }>();
 // row is attributed to the thread's live turn instead of to nothing.
 const liveTurnByThread = new Map<string, string>();
 
+const TOOL_RESULTS_DIR = join(DATA_DIR, "tool-results");
+const TOOL_RESULT_SPILL_MAX = 512 * 1024;
+
+/** A hook event from the engine (item 0.2). PostToolUse carries the tool's
+ * full result: it is redacted, spilled to a private file, and attached to
+ * the activity row the fold already wrote for that call, which flips the
+ * turn's evidence to "full" for the digest. Idempotent on the tool_use_id
+ * (a re-delivered hook never double-writes). Other events are accepted and
+ * ignored here; item 0.4 gives PreCompact/SessionStart/Stop their meaning. */
+function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: boolean; ignored?: string; hookSpecificOutput?: unknown } {
+  const event = body && typeof body === "object" ? (body as { event?: unknown; payload?: unknown }) : {};
+  const name = typeof event.event === "string" ? event.event : "";
+  const payload = event.payload && typeof event.payload === "object" ? (event.payload as Record<string, unknown>) : {};
+  if (name !== "PostToolUse") return { ok: true, ignored: name || "unknown" };
+  const toolUseId = typeof payload.tool_use_id === "string" ? payload.tool_use_id : "";
+  if (!toolUseId) return { ok: true, ignored: "PostToolUse without tool_use_id" };
+  const threadId = capability.threadId;
+  const response = payload.tool_response;
+  const text = typeof response === "string" ? response : JSON.stringify(response ?? null, null, 2);
+  runCommand({ kind: "hook.ingest", key: `${threadId}:${toolUseId}` }, () => {
+    const dir = join(TOOL_RESULTS_DIR, threadId.replace(/[^\w.-]/g, "_"));
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const safeId = toolUseId.replace(/[^\w.-]/g, "_").slice(0, 120);
+    const file = join(dir, `${safeId}.txt`);
+    const redacted = redactSecretsInText(text);
+    const bounded = redacted.length > TOOL_RESULT_SPILL_MAX
+      ? `${redacted.slice(0, TOOL_RESULT_SPILL_MAX)}\n[… ${redacted.length - TOOL_RESULT_SPILL_MAX} more characters omitted]`
+      : redacted;
+    writeFileSync(file, bounded, { mode: 0o600 });
+    const row = [...store.messagesFor(threadId)].reverse().find((m) => m.kind === "activity" && m.tool?.itemId === toolUseId);
+    if (row?.tool) {
+      store.patchMessage(threadId, row.id, { tool: { ...row.tool, outputPath: file, fullResult: true } });
+    }
+    return row?.id ?? null;
+  });
+  return { ok: true };
+}
+
 /** Write the turn's work digest (item 0.1). Runs off the fold's critical
  * path because the file diff shells out to git; the receipt keyed on the
  * turn makes a duplicate settle event harmless. Never throws. */
@@ -3398,7 +3453,7 @@ function scheduleTurnDigest(input: {
         ...(files ? { files } : {}),
         reply: input.reply,
         ...(input.usage ? { usage: input.usage } : {}),
-        hookCoverage: coverageForDriver(input.driverKind),
+        hookCoverage: coverageForDriver(input.driverKind, toolEvidence(activities, input.turnId)),
       });
       runCommand({ kind: "digest.append", key: `${input.threadId}:${input.turnId}` }, () => {
         const message = store.appendMessage(input.threadId, {
@@ -4009,7 +4064,7 @@ bus.subscribe((event: RuntimeEvent) => {
         const message = pushMessage({
           role: "bot",
           kind: "activity",
-          tool: { name, spoken: narrateTool(name) ?? undefined, summary: event.summary, input: event.input },
+          tool: { name, spoken: narrateTool(name) ?? undefined, summary: event.summary, input: event.input, ...(event.itemId ? { itemId: event.itemId } : {}) },
           // attributed to its turn so the digest can count it
           turnId: liveTurnId,
         });
@@ -5715,6 +5770,9 @@ async function startTurn(
         const ownThreadCreation = boundedCoordination && !opts?.coordination && Boolean(origin && !origin.peerAsk);
         integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, skillAuthoring, dispatchClaimId, opts?.coordination?.id, boundedCoordination, ownThreadCreation);
       }
+      if (instance.adapter.capabilities.hooks === true && hooksEnabled()) {
+        integrations.hooks = hooksIntegration(bot.id, threadId, dispatchClaimId);
+      }
       // @mentions in the user's message (the composer's tagging UI) become
       // an explicit coordination nudge. The agent still chooses the matching
       // peer tool, so the harness stays the single owner of turns/permissions.
@@ -7093,6 +7151,9 @@ async function runGroupMemberTurn(
     instance.adapter.capabilities.agentsMcp === true;
   if ((hop < MAX_COMMS_DEPTH || orchestration?.roomHandoffId) && instance.adapter.capabilities.agentsMcp === true) {
     integrations.agents = agentsIntegration(bot.id, threadId, hop, skillAuthoring, internalGeneration, orchestration?.roomHandoffId, !orchestration || Boolean(orchestration.roomHandoffId));
+  }
+  if (instance.adapter.capabilities.hooks === true && hooksEnabled()) {
+    integrations.hooks = hooksIntegration(bot.id, threadId, internalGeneration);
   }
   const latestUser = [...store.activePath(threadId)].reverse().find(
     (message) => message.role === "user" && message.kind === "text" && message.text,
@@ -9982,7 +10043,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!internalSender) {
         return json(res, 401, { error: "unauthorized" });
       }
-      const requiredCapabilityKind = path === "/api/internal/browser/mcp"
+      const requiredCapabilityKind = path === "/api/internal/hook"
+        ? "hooks"
+        : path === "/api/internal/browser/mcp"
         ? "browser"
         : path.startsWith("/api/internal/connectors/")
         ? "connectors"
@@ -10043,6 +10106,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         task: store.taskByThread(internalSender.id, internalCapability.threadId),
         threadId: internalCapability.threadId,
       });
+      if (method === "POST" && path === "/api/internal/hook") {
+        const body = await readInternalBody();
+        return json(res, 200, ingestEngineHook(internalCapability, body));
+      }
       if (method === "POST" && path === "/api/internal/memory") {
         const body = await readInternalBody();
         const result = updateMemory(internalSender.id, { action: body.action, text: body.text, oldText: body.oldText }, { source: memorySource() });

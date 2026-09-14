@@ -29,6 +29,11 @@
 //                      one tool_use (fresh id, that name and input) followed
 //                      by its tool_result (is_error unless ok, default true).
 //                      Unset, a turn makes the single default Bash call.
+//   FAKE_CLAUDE_HOOKS  1: honour the `hooks` block of the --settings file the
+//                      way the real CLI does — after each tool_result run
+//                      every PostToolUse command with the event JSON on
+//                      stdin (synchronously, inheriting this env), and once
+//                      at the end run the Stop commands.
 //   FAKE_CLAUDE_AUTH   in (default) | out | unsupported | malformed |
 //                      inherited-api-key — what `auth status` reports
 //   FAKE_CLAUDE_AUTO_UNAVAILABLE_MODELS comma-separated --model values for
@@ -37,6 +42,7 @@
 //                      Sonnet 4.5: init reports the mode it actually runs in.
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
+import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { runRoomHandoffAgent } from "./room-handoff-agent.ts";
 
@@ -90,6 +96,32 @@ const nextScriptedReply = (): string[] => {
 };
 
 const argv = process.argv.slice(2);
+const settingsHooks: Record<string, Array<{ hooks?: Array<{ type?: string; command?: string; timeout?: number }> }>> = (() => {
+  if (process.env.FAKE_CLAUDE_HOOKS !== "1") return {};
+  const i = argv.indexOf("--settings");
+  if (i === -1) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(argv[i + 1]!, "utf8"));
+    return parsed && typeof parsed.hooks === "object" ? parsed.hooks : {};
+  } catch {
+    return {};
+  }
+})();
+/** Run every command hook registered for `event`, like the real CLI: JSON on
+ * stdin, wait for exit (bounded), ignore its output except to a dump. */
+function runHooks(event: string, payload: Record<string, unknown>): void {
+  for (const entry of settingsHooks[event] ?? []) {
+    for (const hook of entry.hooks ?? []) {
+      if (hook.type !== "command" || !hook.command) continue;
+      spawnSync("sh", ["-c", hook.command], {
+        input: JSON.stringify({ hook_event_name: event, session_id: "fake-session", cwd: process.cwd(), ...payload }),
+        env: process.env,
+        timeout: ((hook.timeout ?? 5) + 1) * 1000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    }
+  }
+}
 const argAfter = (flag: string): string | null => {
   const i = argv.indexOf(flag);
   return i === -1 ? null : (argv[i + 1] ?? null);
@@ -393,6 +425,7 @@ const playTurn = (prompt: JsonValue) => {
       const id = `tu-${++toolUseCount}`;
       out({ type: "assistant", message: { content: [{ type: "tool_use", id, name: call.name, input: call.input }], usage } });
       out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !call.ok, content: call.output }] } });
+      runHooks("PostToolUse", { tool_name: call.name, tool_input: call.input, tool_response: call.output, tool_use_id: id });
     }
     for (const text of replyParts) out({ type: "assistant", message: { content: [{ type: "text", text }], usage } });
   } else {
@@ -404,9 +437,11 @@ const playTurn = (prompt: JsonValue) => {
       out({ type: "assistant", message: { content, usage } });
     });
     out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu-1", is_error: false, content: [{ type: "text", text: "hi" }] }] } });
+    runHooks("PostToolUse", { tool_name: "Bash", tool_input: { command: "echo hi" }, tool_response: "hi", tool_use_id: "tu-1" });
   }
 
   const finish = () => {
+    runHooks("Stop", { stop_hook_active: false });
     out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01, usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 } });
     turnRunning = false;
     finishIfDone();

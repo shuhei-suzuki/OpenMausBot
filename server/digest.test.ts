@@ -163,3 +163,15 @@ describe("coverageForDriver", () => {
     expect(coverageForDriver(undefined)).toBe("preview");
   });
 });
+
+describe("toolEvidence", () => {
+  it("is full only when every tool row of the turn carries a delivered result", async () => {
+    const { toolEvidence } = await import("./digest.ts");
+    const full = { ...activity("Bash", true, "ls"), tool: { name: "Bash", ok: true, fullResult: true } };
+    const preview = activity("Read", true, "a.ts");
+    expect(toolEvidence([full, { ...full, id: "b" }], "turn-1")).toBe(true);
+    expect(toolEvidence([full, preview], "turn-1")).toBe(false);
+    expect(toolEvidence([], "turn-1")).toBe(false);
+    expect(toolEvidence([{ ...full, turnId: "turn-0" }], "turn-1")).toBe(false);
+  });
+});

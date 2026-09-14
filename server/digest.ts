@@ -62,6 +62,14 @@ export function coverageForDriver(driverKind: string | undefined, fullResults = 
   return fullResults ? "full" : "preview";
 }
 
+/** True when every tool row of the turn carries a delivered (untruncated)
+ * result — what a PostToolUse hook gives us — so the digest may claim
+ * "full" evidence. One preview-only row means the turn is "preview". */
+export function toolEvidence(activities: readonly Message[], turnId: string): boolean {
+  const rows = activities.filter((m) => m.kind === "activity" && m.tool && m.turnId === turnId);
+  return rows.length > 0 && rows.every((m) => m.tool?.fullResult === true);
+}
+
 export const MAX_TOOLS = 8;
 export const MAX_FILES = 20;
 export const REPLY_CHARS = 200;

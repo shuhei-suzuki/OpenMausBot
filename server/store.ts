@@ -158,7 +158,18 @@ export interface Message {
    * `summary` is the call's input on one redacted line (the shell command)
    * where the driver only names the tool in `name`. `terminal` marks a
    * failure of the complete turn; later explanatory text cannot erase it. */
-  tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean; terminal?: boolean; summary?: string; input?: string; output?: string };
+  tool?: {
+    name: string; ok?: boolean; spoken?: string; setup?: boolean; terminal?: boolean; summary?: string; input?: string; output?: string;
+    /** The driver's item id for this call (Claude tool_use_id, Codex item id),
+     * so a hook or a later event can find the row again. */
+    itemId?: string;
+    /** Where the harness spilled the full, redacted tool result when a hook
+     * delivered it (under DATA_DIR/tool-results); `output` stays the preview. */
+    outputPath?: string;
+    /** True when the full result reached the harness (hook or protocol), not
+     * only the driver's bounded preview. The digest reads this. */
+    fullResult?: boolean;
+  };
   /** user messages sent INTO a running turn (capabilities.queueing): the
    * model saw it mid-turn, so the transcript marks it — a reader should
    * know the reply above it may already account for this line */
