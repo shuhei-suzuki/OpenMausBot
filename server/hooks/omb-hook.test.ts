@@ -89,3 +89,25 @@ describe("omb-hook helper", () => {
     expect(result.stdout).toBe("");
   }, 15_000);
 });
+
+describe("omb-hook helper: SessionStart context", () => {
+  it("prints the harness's plain-text context on SessionStart, because Claude Code reads stdout as context there", async () => {
+    const url = await listen((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ ok: true, context: "[What Dev did in an earlier turn: tools: Bash ×3 · files: changed retry.ts]" }));
+    });
+    const result = await run(JSON.stringify({ hook_event_name: "SessionStart", source: "compact", session_id: "s1" }), { OMB_HOOK_URL: url, OMB_HOOK_TOKEN_FILE: tokenFile });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("[What Dev did in an earlier turn: tools: Bash ×3 · files: changed retry.ts]");
+  }, 15_000);
+
+  it("ignores a context field on events where stdout is not context", async () => {
+    const url = await listen((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ ok: true, context: "should not be printed" }));
+    });
+    const result = await run(JSON.stringify({ hook_event_name: "PostToolUse", tool_use_id: "t" }), { OMB_HOOK_URL: url, OMB_HOOK_TOKEN_FILE: tokenFile });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+  }, 15_000);
+});

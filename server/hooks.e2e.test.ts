@@ -30,7 +30,7 @@ interface Msg {
 
 const BIG = `line ${"x".repeat(80)}\n`.repeat(200); // ~17 KB: past the 6 KB preview
 
-function harness(label: string, serverEnv: Record<string, string>) {
+function harness(label: string, serverEnv: Record<string, string>, instanceEnv: Record<string, string> = {}) {
   const PORT = 18800 + Math.floor(Math.random() * 10_000);
   const BASE = `http://127.0.0.1:${PORT}`;
   let child: ChildProcess;
@@ -61,6 +61,7 @@ function harness(label: string, serverEnv: Record<string, string>) {
         claude: {
           driver: "claudeAgent",
           environment: {
+            ...instanceEnv,
             FAKE_CLAUDE_HOOKS: "1",
             FAKE_CLAUDE_TOOL_CALLS: JSON.stringify([
               { name: "Bash", input: { command: "cat big.log" }, ok: true, output: BIG },
@@ -136,6 +137,33 @@ posixOnly("engine hooks e2e (fake Claude honouring the settings hooks)", () => {
     const forged = await h.api("POST", "/api/internal/hook", { event: "PostToolUse", payload: { tool_use_id: "x" } }, { authorization: "Bearer not-a-real-token" });
     expect(forged.status).toBe(401);
   });
+});
+
+posixOnly("engine hooks e2e: compaction", () => {
+  const h = harness("compact", {}, { FAKE_CLAUDE_COMPACT: "1", FAKE_CLAUDE_TURN_STATE: join(tmpdir(), `omb-hooks-turns-${process.pid}-${Date.now()}`), FAKE_CLAUDE_PROMPTS: join(tmpdir(), `omb-hooks-prompts-${process.pid}-${Date.now()}.ndjson`) });
+
+  it("records the compaction in the transcript and hands the latest digests back to the engine as plain-text context", async () => {
+    const bot = await h.runTurn();
+    // the fake ran PreCompact then SessionStart(compact) at the start of its
+    // SECOND turn; run one more turn so the first turn's digest exists first
+    expect((await h.api("POST", `/api/bots/${bot.id}/messages`, { text: "and again, after compaction" })).status).toBe(202);
+    await h.waitFor(async () => {
+      const b = await h.getBot(bot.id);
+      return !b.busy && b.messages.filter((m: Msg) => m.kind === "digest").length >= 2;
+    }, "the second turn to settle with its digest");
+    const after = await h.getBot(bot.id);
+    const chips: Msg[] = after.messages.filter((m: Msg) => m.kind === "activity" && m.tool?.name.startsWith("context compact"));
+    expect(chips.map((m) => m.tool!.name)).toEqual([
+      "context compaction started (auto)",
+      "context compacted — re-sent the last 1 digest",
+    ]);
+    // the fake echoes what SessionStart's stdout gave it, which must be the
+    // first turn's digest line
+    const replies: Msg[] = after.messages.filter((m: Msg) => m.role === "bot" && m.kind === "text" && m.text);
+    expect(replies.at(-1)!.text).toContain("[What ");
+    expect(replies.at(-1)!.text).toContain("did in an earlier turn");
+    expect(replies.at(-1)!.text).toContain("Bash ×1");
+  }, 90_000);
 });
 
 posixOnly("engine hooks e2e with OMB_HOOKS=0", () => {

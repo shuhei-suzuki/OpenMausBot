@@ -3385,14 +3385,35 @@ const TOOL_RESULT_SPILL_MAX = 512 * 1024;
  * turn's evidence to "full" for the digest. Idempotent on the tool_use_id
  * (a re-delivered hook never double-writes). Other events are accepted and
  * ignored here; item 0.4 gives PreCompact/SessionStart/Stop their meaning. */
-function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: boolean; ignored?: string; hookSpecificOutput?: unknown } {
+const DIGESTS_AFTER_COMPACTION = 2;
+function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: boolean; ignored?: string; context?: string; hookSpecificOutput?: unknown } {
   const event = body && typeof body === "object" ? (body as { event?: unknown; payload?: unknown }) : {};
   const name = typeof event.event === "string" ? event.event : "";
   const payload = event.payload && typeof event.payload === "object" ? (event.payload as Record<string, unknown>) : {};
+  const threadId = capability.threadId;
+  const chip = (text: string) => store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name: text, ok: true } });
+  // Compaction is a harness event with a record, not something that silently
+  // happens to the model: a chip before, and after it the latest digests go
+  // back in as plain-text context so the compacted session still knows what
+  // its earlier turns DID (the CLI's own summary keeps what was said).
+  if (name === "PreCompact") {
+    const trigger = payload.trigger === "manual" ? "manual" : "auto";
+    chip(`context compaction started (${trigger})`);
+    return { ok: true };
+  }
+  if (name === "SessionStart") {
+    if (payload.source !== "compact") return { ok: true, ignored: `SessionStart ${String(payload.source ?? "")}` };
+    const bot = store.bot(capability.botId);
+    const digests = store.messagesFor(threadId).filter((m) => m.kind === "digest" && m.digest).slice(-DIGESTS_AFTER_COMPACTION);
+    chip(`context compacted — re-sent the last ${digests.length} digest${digests.length === 1 ? "" : "s"}`);
+    if (!digests.length) return { ok: true };
+    const context = digests.map((m) => digestPromptLine(m.digest!, bot?.name ?? "the bot")).join("\n");
+    return { ok: true, context };
+  }
+  if (name === "Stop") return { ok: true };
   if (name !== "PostToolUse") return { ok: true, ignored: name || "unknown" };
   const toolUseId = typeof payload.tool_use_id === "string" ? payload.tool_use_id : "";
   if (!toolUseId) return { ok: true, ignored: "PostToolUse without tool_use_id" };
-  const threadId = capability.threadId;
   const response = payload.tool_response;
   const text = typeof response === "string" ? response : JSON.stringify(response ?? null, null, 2);
   runCommand({ kind: "hook.ingest", key: `${threadId}:${toolUseId}` }, () => {

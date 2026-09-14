@@ -16,6 +16,7 @@
 // stdout is the hook channel — never console.log anything else here.
 import { readFileSync } from "node:fs";
 
+const CONTEXT_EVENTS = new Set(["SessionStart", "UserPromptSubmit"]);
 const budgetMs = Number(process.env.OMB_HOOK_TIMEOUT_MS) > 0 ? Number(process.env.OMB_HOOK_TIMEOUT_MS) : 4_000;
 const url = process.env.OMB_HOOK_URL ?? "";
 const tokenFile = process.env.OMB_HOOK_TOKEN_FILE ?? "";
@@ -67,9 +68,16 @@ async function main(): Promise<void> {
       signal: controller.signal,
     });
     if (!response.ok) return done();
-    const body = (await response.json().catch(() => null)) as { hookSpecificOutput?: unknown } | null;
+    const body = (await response.json().catch(() => null)) as { hookSpecificOutput?: unknown; context?: unknown } | null;
     if (body && typeof body === "object" && body.hookSpecificOutput && typeof body.hookSpecificOutput === "object") {
       return done({ hookSpecificOutput: body.hookSpecificOutput });
+    }
+    // On SessionStart (and UserPromptSubmit) Claude Code reads plain-text
+    // stdout as context the model sees; on every other event stdout is
+    // only a debug line, so a context body is printed nowhere else.
+    if (body && typeof body === "object" && typeof body.context === "string" && body.context && CONTEXT_EVENTS.has(event)) {
+      process.stdout.write(body.context);
+      return done();
     }
     return done();
   } catch {

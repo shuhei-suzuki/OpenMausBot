@@ -344,6 +344,26 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
 | 0.7 compaction record | manual route | manual route | manual route | manual route | manual route (only compaction they have) | manual route |
 | 0.8 bench driver | full | full | full | full | full | full |
 
+## Findings while building (hand-offs to later phases)
+
+- **F1 (Phase 1, prefix and cache discipline): the Claude CLI is respawned on every turn
+  whenever the agents tools are mounted.** `drivers/claude.ts` keys the live process on
+  `argsKey`, which embeds `mcpServers` verbatim; `mcpServers.agents.env.OMB_COMMS_TOKEN` (and the
+  computer/browser tokens) are minted per turn generation, so the key never matches and the
+  "reuse the live process when it is idle and unchanged" branch is dead in practice. Proven in
+  the hooks e2e: a `FAKE_CLAUDE_DUMP` (first prompt per process) written by the second turn held
+  the second user message. Consequence: every turn is a fresh `--resume` launch, which the
+  driver's own comment on the volatile split describes as re-uploading the conversation at the
+  cache-write rate. Fix shape: key on the MCP server *identities and commands*, not on rotating
+  secrets, and deliver rotating tokens the way hooks now do (a per-thread file the driver rewrites
+  every turn), or pass them through the MCP config on reuse. Measure with 0.6 before and after.
+- **F2 (Phase 0, item 0.4 as built): Claude Code's PreCompact hook cannot inject context and
+  SessionStart accepts plain-text stdout, not `additionalContext`.** The hook helper therefore
+  prints the harness's `context` string as plain text on SessionStart only; PreCompact is observed
+  (a transcript chip) and compaction *guidance* has to travel through the CLI's own channels
+  (`# Compact instructions` in the generated project instructions, or `/compact <focus>` when the
+  harness triggers compaction itself in 0.7).
+
 ## Steps (each one PR-sized, in order)
 
 1. `commands.ts` + `command_receipts` table + tests (0.5). No callers yet.
@@ -355,7 +375,8 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
    `--settings` file always written; `hookCoverage: "full"`. Tests: hook helper unit tests (exit 0
    on garbage stdin, 5 s timer), route tests with a forged token (must refuse), fake-engine e2e
    where `FAKE_CLAUDE_*` emits a hook call.
-4. `PreCompact` / `SessionStart(compact)` / `Stop` hooks; inspector shows compaction events.
+4. `PreCompact` / `SessionStart(compact)` / `Stop` hooks: compaction recorded as transcript
+   chips, the last two digests re-sent as plain-text context after it (see F2).
 5. `launch-budget.ts` wired into `spawnCli` callers; settings numbers; typed denial; tests for the
    pure decision function and for "routine parks, does not fail".
 6. `metrics.ts`: prompt-shape event + ledger field, cache-hit share, tokens per task, CSV export,
