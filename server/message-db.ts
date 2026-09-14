@@ -62,6 +62,13 @@ function open(): DatabaseSync {
       payload TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS chat_followups_receipt ON chat_followups(kind, owner_id, thread_id, send_id);
+    CREATE TABLE IF NOT EXISTS command_receipts (
+      kind TEXT NOT NULL,
+      key TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      result TEXT NOT NULL,
+      PRIMARY KEY (kind, key)
+    );
   `);
   ensureRecallIndex(db);
   ensureMemoryIndex(db);
@@ -204,6 +211,54 @@ function writeFollowups(write: (connection: DatabaseSync) => void): void {
     try { write(connection); connection.exec("COMMIT"); }
     catch (error) { connection.exec("ROLLBACK"); throw error; }
   } finally { connection.exec("PRAGMA synchronous = NORMAL"); }
+}
+
+export interface StoredCommandReceipt {
+  kind: string;
+  key: string;
+  at: number;
+  /** JSON text of the command's result, exactly as first produced. */
+  result: string;
+}
+
+export function readCommandReceipt(kind: string, key: string): StoredCommandReceipt | null {
+  const row = db()
+    .prepare("SELECT kind, key, at, result FROM command_receipts WHERE kind = ? AND key = ?")
+    .get(kind, key) as StoredCommandReceipt | undefined;
+  return row ?? null;
+}
+
+/** Run `apply` and record its receipt in ONE transaction on the transcript
+ * DB, so a command's rows and the proof that it ran land together or not
+ * at all. A receipt already present short-circuits: the stored result is
+ * returned and `apply` never runs. Everything `apply` writes through this
+ * module (insertMessage, setActiveLeaf, ...) joins the same transaction. */
+export function withCommandReceipt(
+  kind: string,
+  key: string,
+  apply: () => string,
+  at: number,
+): { result: string; replayed: boolean } {
+  const database = db();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const existing = database
+      .prepare("SELECT result FROM command_receipts WHERE kind = ? AND key = ?")
+      .get(kind, key) as { result: string } | undefined;
+    if (existing) {
+      database.exec("COMMIT");
+      return { result: existing.result, replayed: true };
+    }
+    const result = apply();
+    database
+      .prepare("INSERT INTO command_receipts(kind, key, at, result) VALUES (?, ?, ?, ?)")
+      .run(kind, key, at, result);
+    database.exec("COMMIT");
+    return { result, replayed: false };
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 export function saveChatFollowup(followup: Omit<ChatFollowup, "status">): void {
