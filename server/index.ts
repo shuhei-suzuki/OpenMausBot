@@ -43,6 +43,7 @@ import {
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { runCommand } from "./commands.ts";
+import { writeTurnToken } from "./turn-token.ts";
 import { LaunchBudget, type LaunchKind, type LaunchTicket } from "./launch-budget.ts";
 import { classifyError } from "./drivers/retry.ts";
 import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest, toolEvidence } from "./digest.ts";
@@ -852,7 +853,9 @@ function agentsIntegration(
       OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
       OMB_BOT_ID: botId,
       OMB_THREAD_ID: threadId,
-      OMB_COMMS_TOKEN: token,
+      // the token rotates every turn; the file path does not, so a reused
+      // engine process and its proxy stay valid (turn-token.ts, finding F1)
+      OMB_COMMS_TOKEN_FILE: writeTurnToken("comms", botId, threadId, token),
       OMB_TURN_DEPTH: String(depth),
       OMB_ROOM_TURN: roomCoordination ? "1" : "0",
       OMB_OWN_THREAD_CREATION: ownThreadCreation ? "1" : "0",
@@ -1187,7 +1190,7 @@ async function browserIntegration(botId: string, profile: string | undefined, tu
     kind: "browser", depth: 0, skillAuthoring: false, createdBots: 0, openedThreads: 0 });
   return { profile: partitionId, session, spec, integration: {
     command: process.execPath, args: [SPAWNED_PROXIES.browser], env: {
-      ...AGENTS_NODE_FLAG, OMB_BROWSER_TOKEN: token, OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
+      ...AGENTS_NODE_FLAG, OMB_BROWSER_TOKEN_FILE: writeTurnToken("browser", botId, turn.threadId, token), OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
     },
   } };
 }

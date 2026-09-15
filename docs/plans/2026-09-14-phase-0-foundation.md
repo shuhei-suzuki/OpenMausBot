@@ -357,6 +357,13 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
   cache-write rate. Fix shape: key on the MCP server *identities and commands*, not on rotating
   secrets, and deliver rotating tokens the way hooks now do (a per-thread file the driver rewrites
   every turn), or pass them through the MCP config on reuse. Measure with 0.6 before and after.
+  **Fixed in Phase 0 (Sep 15), pulled forward at the owner's request:** `server/turn-token.ts`
+  writes each integration's per-turn bearer to a stable, private per-(kind, bot, thread) file
+  and the environment names the file; the agents, browser and connector proxies read it on every
+  request (`turn-token-read.ts`). The spawn contract now sees only stable paths, and the hooks
+  e2e proves the second turn reuses the live CLI process. Still per-turn in env, by design:
+  computer control tokens (`OMB_CONTROL_TOKEN`), because the container MCP runs inside the box
+  where a host file path means nothing; a bot with a computer mounted still respawns per turn.
 - **F2 (Phase 0, item 0.4 as built): Claude Code's PreCompact hook cannot inject context and
   SessionStart accepts plain-text stdout, not `additionalContext`.** The hook helper therefore
   prints the harness's `context` string as plain text on SessionStart only; PreCompact is observed
