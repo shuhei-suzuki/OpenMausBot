@@ -5,14 +5,29 @@ import { appendFileSync, readFileSync, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { waitForExit } from "./cleanup.ts";
 
-export async function runRoomHandoffAgent(argv: string[], planPath: string, prompt?: unknown): Promise<string> {
+/** The launch files as the real CLI sees them: read ONCE, at start. The
+ * driver deletes the MCP config and system prompt files after the first
+ * turn (they hold credentials), and a live process keeps serving later
+ * turns from what it already read — so a caller that keeps one process
+ * across turns passes the contents it captured at launch. */
+export interface LaunchFiles {
+  mcpConfig: string;
+  system: string;
+}
+
+export function readLaunchFiles(argv: string[]): LaunchFiles {
   const arg = (flag: string) => argv[argv.indexOf(flag) + 1];
-  const config = JSON.parse(readFileSync(arg("--mcp-config"), "utf8"));
+  return { mcpConfig: readFileSync(arg("--mcp-config"), "utf8"), system: readFileSync(arg("--append-system-prompt-file"), "utf8") };
+}
+
+export async function runRoomHandoffAgent(argv: string[], planPath: string, prompt?: unknown, launch: LaunchFiles = readLaunchFiles(argv)): Promise<string> {
+  const arg = (flag: string) => argv[argv.indexOf(flag) + 1];
+  const config = JSON.parse(launch.mcpConfig);
   const integration = Object.values(config.mcpServers as Record<string, { command: string; args: string[]; env: Record<string, string> }>)
     .find(s => s.env?.OMB_BOT_ID);
   if (!integration) throw new Error("The room agent did not receive its agents integration");
   const botId = integration.env.OMB_BOT_ID;
-  const system = readFileSync(arg("--append-system-prompt-file"), "utf8");
+  const system = launch.system;
   const resumed = system.includes("Your downstream room requests have settled.");
   const basePlan = JSON.parse(readFileSync(planPath, "utf8"))[botId] ?? {};
   const previous = existsSync(`${planPath}.evidence.jsonl`) ? readFileSync(`${planPath}.evidence.jsonl`, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
