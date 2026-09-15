@@ -47,6 +47,7 @@ import { selectReplay, type ReplayEntry } from "./context-rebuild.ts";
 import { promptShape, stableSectionChanges, summarizeMetrics, type PromptShape } from "./metrics.ts";
 import { writeTurnToken } from "./turn-token.ts";
 import { LaunchBudget, type LaunchKind, type LaunchTicket } from "./launch-budget.ts";
+import { benchResult, budgetExceeded, parseBudget, type BenchRun } from "./bench.ts";
 import { classifyError } from "./drivers/retry.ts";
 import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest, toolEvidence } from "./digest.ts";
 import { filterCommand } from "./hooks/filters.ts";
@@ -3429,6 +3430,55 @@ const filteredCommandsByThread = new Map<string, number>();
 const TOOL_RESULTS_DIR = join(DATA_DIR, "tool-results");
 const TOOL_RESULT_SPILL_MAX = 512 * 1024;
 
+// ── Bench runs (item 0.8) ────────────────────────────────────────────────
+// One detached, unattended turn per run. The ordinary fold does the work;
+// this only watches the budget from the side and records the outcome, so
+// it is the same for every engine a bot can be configured with.
+const benchRuns = new Map<string, BenchRun>();
+const benchRunByThread = new Map<string, BenchRun>();
+function benchRunForThread(threadId: string): BenchRun | undefined {
+  for (const run of benchRuns.values()) if (run.threadId === threadId) return run;
+  return undefined;
+}
+async function interruptBenchRun(run: BenchRun, exceeded: BenchRun["exceeded"]): Promise<void> {
+  if (run.status !== "running") return;
+  run.status = "budget_exceeded";
+  run.exceeded = exceeded;
+  run.endedAt = Date.now();
+  const bot = store.bot(run.botId);
+  const selection = store.taskByThread(run.botId, run.threadId)?.modelSelection ?? bot?.modelSelection;
+  const instance = selection ? registry.get(selection.instanceId) : null;
+  cancelDirectTurnDispatch(run.botId, run.threadId);
+  revokeInternalCapabilitiesForThread(run.threadId);
+  try {
+    await instance?.adapter.interruptTurn(run.threadId);
+  } catch {
+    /* the turn may already be gone */
+  } finally {
+    closeOpenApprovals(run.threadId);
+  }
+}
+bus.subscribe((event: RuntimeEvent) => {
+  if (shouldIgnoreProviderEvent(event)) return;
+  const run = benchRunByThread.get(event.threadId);
+  if (!run) return;
+  if (event.type === "item.completed" && event.itemType === "tool") run.steps += 1;
+  else if (event.type === "thread.token-usage.updated") run.liveTokens = Math.max(run.liveTokens ?? 0, event.input + event.output);
+  else if (event.type === "turn.completed") {
+    run.turns += 1;
+    if (event.usage) run.tokens = { input: event.usage.input, output: event.usage.output, cachedInput: event.usage.cachedInput ?? 0 };
+    if (typeof event.cost === "number") run.costUsd = event.cost;
+    run.stopReason = event.stopReason ?? null;
+    if (run.status === "running") run.status = event.ok ? "settled" : "failed";
+    run.endedAt ??= Date.now();
+    benchRunByThread.delete(run.threadId);
+    return;
+  }
+  if (run.status !== "running") return;
+  const exceeded = budgetExceeded(run, Date.now());
+  if (exceeded) void interruptBenchRun(run, exceeded);
+});
+
 /** A hook event from the engine (item 0.2). PostToolUse carries the tool's
  * full result: it is redacted, spilled to a private file, and attached to
  * the activity row the fold already wrote for that call, which flips the
@@ -4470,6 +4520,8 @@ bus.subscribe((event: RuntimeEvent) => {
           costUsd: event.cost ?? null,
           trigger: routineRun
             ? { kind: "routine", routineId: routineRun.routineId, label: routineRun.routineName }
+            : benchRunForThread(event.threadId)
+              ? { kind: "bench", runId: benchRunForThread(event.threadId)!.id }
             : internal
               ? { kind: "bot", ...(settledTask?.openedBy?.botId ? { botId: settledTask.openedBy.botId } : {}) }
               : turnTriggers.get(event.threadId) ?? { kind: "owner" },
@@ -5271,7 +5323,7 @@ async function startTurn(
     runOn?: RoutineRunOn;
     /** Lets the system prompt put externally supplied payloads behind an
      * explicit untrusted-data boundary without changing ordinary chat. */
-    automationSource?: RoutineRunTrigger;
+    automationSource?: RoutineRunTrigger | "bench";
     /** the caller was already running unattended, so this turn is too */
     unattended?: boolean;
     /** Bot delivery (including self-opened jobs): whose words this line carries,
@@ -14755,6 +14807,74 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const fresh = botWithThread(store.bot(bot.id)!);
       broadcast({ kind: "bot", bot: fresh });
       return json(res, 201, { compaction: { messageId: message, summary, tokensBefore, by } });
+    }
+    // Item 0.8: the headless bench driver. One task on one bot, unattended,
+    // inside a budget; the result and trajectory are readable by a script.
+    if (method === "POST" && path === "/api/bench/run") {
+      const body = await readBody(req);
+      const botId = typeof body?.botId === "string" ? body.botId : "";
+      const bot = botId ? store.bot(botId) : null;
+      if (!bot) return json(res, 404, { error: "no such bot (botId)" });
+      const taskText = typeof body?.task === "string" ? body.task.trim() : "";
+      if (!taskText) return json(res, 400, { error: "task must be a non-empty string" });
+      let budget: ReturnType<typeof parseBudget>;
+      try {
+        budget = parseBudget(body?.budget);
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      const cwd = typeof body?.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : undefined;
+      if (cwd && !existsSync(cwd)) return json(res, 400, { error: `cwd does not exist: ${cwd}` });
+      const allowRaw = body?.network && typeof body.network === "object" ? (body.network as { allow?: unknown }).allow : undefined;
+      const allow = Array.isArray(allowRaw) ? allowRaw.filter((host): host is string => typeof host === "string" && host.trim().length > 0) : null;
+      const task = store.createTask(bot.id, `bench · ${taskText.slice(0, 40)}`, false);
+      if (!task) return json(res, 500, { error: "could not open a task for the run" });
+      if (cwd) store.patchTask(bot.id, task.threadId, { cwd });
+      broadcast({ kind: "bot", bot: publicBot(store.bot(bot.id)!) });
+      const selection = task.modelSelection ?? bot.modelSelection;
+      const run: BenchRun = {
+        id: randomUUID(),
+        botId: bot.id,
+        botName: bot.name,
+        threadId: task.threadId,
+        task: taskText,
+        ...(cwd ? { cwd } : {}),
+        budget,
+        ...(allow ? { network: { allow } } : {}),
+        startedAt: Date.now(),
+        status: "running",
+        steps: 0,
+        turns: 0,
+        tokens: { input: 0, output: 0, cachedInput: 0 },
+        costUsd: null,
+        driverKind: registry.get(selection.instanceId)?.driverKind ?? "unknown",
+        model: selection.model,
+      };
+      benchRuns.set(run.id, run);
+      benchRunByThread.set(run.threadId, run);
+      const timer = setTimeout(() => { void interruptBenchRun(run, "minutes"); }, budget.minutes * 60_000);
+      timer.unref?.();
+      try {
+        await startTurn(bot.id, taskText, { threadId: task.threadId, automationSource: "bench" });
+      } catch (error) {
+        run.status = "failed";
+        run.endedAt = Date.now();
+        run.stopReason = error instanceof Error ? error.message : String(error);
+        benchRunByThread.delete(run.threadId);
+        const status = typeof (error as { status?: unknown })?.status === "number" ? (error as { status: number }).status : 500;
+        return json(res, status, { error: run.stopReason, run: benchResult(run) });
+      }
+      return json(res, 202, { run: benchResult(run) });
+    }
+    m = path.match(/^\/api\/bench\/runs\/([\w-]+)$/);
+    if (m && method === "GET") {
+      const run = benchRuns.get(m[1]);
+      if (!run) return json(res, 404, { error: "no such bench run" });
+      res.setHeader("cache-control", "no-store");
+      if (run.status === "running") return json(res, 200, { run: benchResult(run) });
+      await flushUsageLedger(DATA_DIR);
+      const usage = readUsage(DATA_DIR, { from: new Date(run.startedAt - 86_400_000), to: new Date() }).filter((row) => row.threadId === run.threadId);
+      return json(res, 200, { run: benchResult(run), trajectory: { messages: store.activePath(run.threadId), usage } });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)$/);
     if (m && method === "POST") {

@@ -19,6 +19,8 @@ export type UsageTrigger =
   | { kind: "user"; email?: string; label?: string }
   | { kind: "owner" }
   | { kind: "routine"; routineId?: string; label?: string }
+  /** A headless bench run (item 0.8): unattended, budgeted, never a person. */
+  | { kind: "bench"; runId?: string }
   | { kind: "bot"; botId?: string };
 
 export interface UsageRow {
@@ -207,6 +209,8 @@ export function triggerKey(trigger: UsageTrigger): string {
       return "owner";
     case "routine":
       return `routine:${trigger.routineId ?? trigger.label ?? "unknown"}`;
+    case "bench":
+      return `bench:${trigger.runId ?? "unknown"}`;
     default:
       return "bot";
   }
@@ -220,6 +224,8 @@ export function triggerLabel(trigger: UsageTrigger): string {
       return "This computer";
     case "routine":
       return `Routine: ${trigger.label ?? trigger.routineId ?? "unknown"}`;
+    case "bench":
+      return "Bench run";
     default:
       return "Bot to bot";
   }

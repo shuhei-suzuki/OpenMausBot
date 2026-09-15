@@ -1,6 +1,7 @@
 # Phase 0 — foundation: the harness sees what a bot did, and starts measuring
 
-Status: plan (Sep 14, 2026). First phase of the harness-upgrade programme described in
+Status: built on branch `phase-0/foundation` (Sep 15, 2026; steps 1–10 below, one commit each;
+findings F1–F5 record what was pulled forward or deferred). First phase of the harness-upgrade programme described in
 `../../../harness-gap-analysis.md` (§17, "foundation first, team last"). Composes with
 `agent-harness-upgrades.md` item 7 (portable context, unbuilt) and item 15 (raw inspector, done).
 Touches no bot-to-bot behaviour: delegation, rooms, peer comms and shared memory are untouched
@@ -402,6 +403,12 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
 
 ## Steps (each one PR-sized, in order)
 
+Status, Sep 15: all ten steps are built and tested on `phase-0/foundation`. Deviations from
+the text below, each recorded as a finding above: F1 (Claude CLI reuse) was fixed inside this
+phase; step 8 shipped the engine-agnostic baseline only (F4); step 9 ships off by default with
+its measurement gate open (F5); step 10's live Terminal-Bench numbers are not yet run
+(`docs/bench/2026-09-baseline.md` says exactly what was measured and what was not).
+
 1. `commands.ts` + `command_receipts` table + tests (0.5). No callers yet.
 2. `digest.ts`: build from activity rows + memory-journal + checkpoint `diffStat`; `kind: "digest"`
    in `store.ts`/`message-db.ts`; fold writes it at settle; renderer chip; replay + room context
@@ -457,7 +464,10 @@ Follow `docs/verification/README.md`: every claim below is proven against an iso
 - Recipe added to `docs/verification/digests.md` and `docs/verification/hooks.md` with the exact
   `pnpm control:omb` commands.
 - Measurement gates before merge of step 9: tokens per task on the bench fixture must not
-  increase; cache-hit share must not decrease.
+  increase; cache-hit share must not decrease. (As built: the filter is opt-in and off by
+  default, so the gate applies to flipping the default, not to merging the code — F5.)
+- Recipes as built: `docs/verification/digests.md`, `hooks.md`, `bench.md`; matrix e2e files:
+  `digest.e2e`, `hooks.e2e`, `launch-budget.e2e`, `typed-turns.e2e`, `bench.e2e`.
 
 ## Out of scope (deliberately)
 
