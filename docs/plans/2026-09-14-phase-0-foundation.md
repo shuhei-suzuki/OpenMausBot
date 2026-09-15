@@ -364,6 +364,13 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
   e2e proves the second turn reuses the live CLI process. Still per-turn in env, by design:
   computer control tokens (`OMB_CONTROL_TOKEN`), because the container MCP runs inside the box
   where a host file path means nothing; a bot with a computer mounted still respawns per turn.
+- **F3 (Phase 1, prefix discipline; measured by 0.6 from now on): bundled skills are selected
+  by trigger terms in the user's text and inlined into the `skill-instructions` section of the
+  STABLE prompt half** (`server/skill-library.ts:selectBundledSkills`, rendered at dispatch), so a
+  message that trips a trigger changes the spawn contract and the cache prefix for that turn and
+  the next. The `stablePrefixChanges` count per bot in `/api/metrics` makes this visible; the fix
+  (Phase 1) is to deliver selected skill bodies through the volatile half or as a turn-text
+  attachment, keeping the stable prefix stable.
 - **F2 (Phase 0, item 0.4 as built): Claude Code's PreCompact hook cannot inject context and
   SessionStart accepts plain-text stdout, not `additionalContext`.** The hook helper therefore
   prints the harness's `context` string as plain text on SessionStart only; PreCompact is observed
@@ -390,8 +397,12 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
    after a bounded turn lifetime and are released on any terminal event, so a dispatch that
    dies mid-setup cannot starve the cap; typed `launch_budget` refusal that routines park on;
    `GET /api/launch-budget`; config `launches.{maxConcurrent,maxPerHour,maxPerDay}`.
-6. `metrics.ts`: prompt-shape event + ledger field, cache-hit share, tokens per task, CSV export,
-   sidebar tooltip.
+6. `metrics.ts`: prompt shape per turn (stable/volatile bytes, replay, stable sections that
+   changed since the previous turn) booked on the usage row with duration and evidence coverage;
+   `GET /api/metrics` with per-bot, per-engine and per-trigger tokens per turn and per task,
+   cache-hit share (honestly null where an engine reports no cached tokens), replays,
+   stable-prefix changes and coverage. CSV columns and the sidebar tooltip are deferred to the
+   Phase 1 UI pass; room turns record no shape yet (Phase 6).
 7. Replay by bytes with digests; `compaction` message kind and manual compact route (0.7).
 8. Typed turns: contract field, Claude and Codex driver paths, schema validation, goal-room
    schema-first decision with prose fallback (0.3).

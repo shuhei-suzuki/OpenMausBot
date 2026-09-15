@@ -141,6 +141,24 @@ posixOnly("work digest e2e (every fake engine)", () => {
     expect(d!.digest!.tools.reduce((n, t) => n + t.count, 0)).toBe(activities.length);
   }, 45_000);
 
+  it("books per-turn measurement for every engine: shape, coverage, duration, and serves the summary", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const metrics = await api("GET", `/api/metrics?from=${today}&to=${today}`);
+    expect(metrics.status).toBe(200);
+    expect(metrics.body.total.turns).toBeGreaterThanOrEqual(ENGINES.length);
+    for (const engine of ENGINES) {
+      const row = metrics.body.engines.find((e: { driverKind: string }) => e.driverKind === engine.driver);
+      expect(row, `metrics for ${engine.driver}`).toBeTruthy();
+      expect(row.turns).toBeGreaterThanOrEqual(1);
+      expect(row.coverage.preview + row.coverage.full + row.coverage.none).toBe(row.turns);
+      expect(row.promptBytes.turns).toBe(row.turns);
+      expect(row.promptBytes.stable).toBeGreaterThan(0);
+      expect(row.durationMs.turns).toBe(row.turns);
+      // cache share is a number where the engine reports cached tokens, else honestly null
+      expect(row.cacheHitShare.share === null || typeof row.cacheHitShare.share === "number").toBe(true);
+    }
+  });
+
   it("names the project files a turn changed, and a different engine taking over sees that in its replay", async () => {
     const project = mkdtempSync(join(tmpdir(), "omb-digest-project-"));
     writeFileSync(join(project, "README.md"), "hello");

@@ -43,6 +43,7 @@ import {
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { runCommand } from "./commands.ts";
+import { promptShape, stableSectionChanges, summarizeMetrics, type PromptShape } from "./metrics.ts";
 import { writeTurnToken } from "./turn-token.ts";
 import { LaunchBudget, type LaunchKind, type LaunchTicket } from "./launch-budget.ts";
 import { classifyError } from "./drivers/retry.ts";
@@ -3403,6 +3404,10 @@ bus.subscribe((event: RuntimeEvent) => {
 // and the checkpoint taken at dispatch (hash + folder) so settle can diff.
 const turnStartedAt = new Map<string, number>();
 const turnCheckpoints = new Map<string, { cwd: string; hash: string }>();
+// The prompt shape of the turn in flight, and the last one booked, per
+// thread — the second is what "did the stable prefix change?" compares to.
+const promptShapeByThread = new Map<string, PromptShape>();
+const lastPromptSectionsByThread = new Map<string, Array<{ id: string; bytes: number }>>();
 // The turn a thread is in, from the last event that named one. Not every
 // driver stamps every item with a turnId (ACP fakes, some ACP agents), and
 // a digest can only count activity it can attribute — so an unstamped tool
@@ -4417,7 +4422,16 @@ bus.subscribe((event: RuntimeEvent) => {
         // the task and answers "what did we spend, by whom" for a period
         const settledTask = store.taskByThread(bot.id, event.threadId);
         const selection = settledTask?.modelSelection ?? bot.modelSelection;
+        const shape = promptShapeByThread.get(event.threadId);
+        promptShapeByThread.delete(event.threadId);
+        if (shape) lastPromptSectionsByThread.set(event.threadId, shape.sections);
+        const startedAt = turnStartedAt.get(event.threadId);
+        const settledDriverKind = registry.get(selection.instanceId)?.driverKind;
         appendUsage(DATA_DIR, {
+          ...(completedTurnId ? { turnId: completedTurnId } : {}),
+          ...(startedAt ? { durationMs: Math.max(0, Date.now() - startedAt) } : {}),
+          ...(completedTurnId ? { hookCoverage: coverageForDriver(settledDriverKind, toolEvidence(store.messagesFor(event.threadId), completedTurnId)) } : {}),
+          ...(shape ? { promptShape: { stableBytes: shape.stableBytes, volatileBytes: shape.volatileBytes, totalBytes: shape.totalBytes, replayed: shape.replayed, replayBytes: shape.replayBytes, ...(shape.stableChanged?.length ? { stableChanged: shape.stableChanged } : {}) } } : {}),
           botId: bot.id,
           botName: bot.name,
           threadId: event.threadId,
@@ -5977,6 +5991,13 @@ async function startTurn(
         { id: "mentions", label: "Mentions", text: boundedCoordination && tagged.length ? `The user named these existing teammates: ${tagged.map(b => `${peerName(b.name)} (${b.id})`).join(", ")}. Use coordinate_bots when their contribution is needed; do not substitute native helper agents for these bots.` : mentionPrompt(tagged) },
       ]);
       runningTurnEngines.set(threadId, instance);
+      {
+        // item 0.6: what this turn's prompt cost, and whether its stable half
+        // moved since the last turn on this thread (a cache miss when it did)
+        const shape = promptShape(prompt.sections, { replayed: !resume, replayBytes: Buffer.byteLength(turnText, "utf8") });
+        shape.stableChanged = stableSectionChanges(lastPromptSectionsByThread.get(threadId), shape.sections);
+        promptShapeByThread.set(threadId, shape);
+      }
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: bot.id,
@@ -15557,6 +15578,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
 
     // ── app config (API keys — never echoed back, booleans only) ──
+    if (method === "GET" && path === "/api/metrics") {
+      const range = parseUsageRange(url.searchParams.get("from"), url.searchParams.get("to"));
+      if (!range) return json(res, 400, { error: "from and to must be YYYY-MM-DD, from no later than to, at most a year apart" });
+      res.setHeader("cache-control", "no-store");
+      return json(res, 200, { from: range.from.toISOString(), to: range.to.toISOString(), ...summarizeMetrics(readUsage(DATA_DIR, range)) });
+    }
     if (method === "GET" && path === "/api/launch-budget") {
       launchBudget.setLimits(launchLimits(cfg));
       return json(res, 200, launchBudget.snapshot());
