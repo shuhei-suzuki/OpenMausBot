@@ -43,6 +43,7 @@ import {
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { runCommand } from "./commands.ts";
+import { selectReplay, type ReplayEntry } from "./context-rebuild.ts";
 import { promptShape, stableSectionChanges, summarizeMetrics, type PromptShape } from "./metrics.ts";
 import { writeTurnToken } from "./turn-token.ts";
 import { LaunchBudget, type LaunchKind, type LaunchTicket } from "./launch-budget.ts";
@@ -123,6 +124,7 @@ import {
   roomTurnTimeoutMinutes,
   maxConcurrentBotThreads,
   launchLimits,
+  contextRebuildBytes,
   saveConfig,
   showToolCallsEnabled,
   skillAuthoringEnabled,
@@ -5424,16 +5426,24 @@ async function startTurn(
   // strictly limited to the selected branch below.
   const messagesById = new Map(store.messagesFor(threadId).map((message) => [message.id, message]));
   // digests ride along: a rebuilt context carries what earlier turns DID,
-  // not only what was said (item 0.1)
-  const transcript = activeMessages
-    .filter((m) => ((m.kind === "text" && m.text) || (m.kind === "digest" && m.digest) || m.roomRequest?.phase === "result") && !skipTranscript.has(m.id))
-    .slice(-40)
+  // not only what was said (item 0.1). The rebuild is selected by BYTES,
+  // newest first, after the latest compaction record (item 0.7).
+  const replayEntries: ReplayEntry[] = activeMessages
+    .filter((m) => ((m.kind === "text" && m.text) || (m.kind === "digest" && m.digest) || m.kind === "compaction" || m.roomRequest?.phase === "result") && !skipTranscript.has(m.id))
     .map((m) => ({
+      id: m.id,
       role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-      text: m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
+      text: m.kind === "compaction" ? ""
+        : m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
         : m.kind === "digest" && m.digest ? digestPromptLine(m.digest, bot.name)
         : transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
     }));
+  const compactionRecord = [...activeMessages].reverse().find((m) => m.kind === "compaction" && m.compaction)?.compaction;
+  const replay = selectReplay(replayEntries, {
+    budgetBytes: contextRebuildBytes(cfg),
+    ...(compactionRecord ? { compaction: { firstKeptId: compactionRecord.firstKeptId, summary: compactionRecord.summary } } : {}),
+  });
+  const transcript = [...replay.lead, ...replay.transcript.filter((e) => e.text)].map(({ role, text }) => ({ role, text }));
 
   // After a rewind (edit / branch switch) the provider's native session
   // still contains the abandoned branch: start a fresh session instead of
@@ -5453,7 +5463,9 @@ async function startTurn(
   const fresh =
     !rewound &&
     !externalContextMarker &&
-    engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
+    // the fresh check needs the thread's real history, not the byte-selected
+    // replay (which may hold no user line at all right after a compaction)
+    engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript: replayEntries });
   // Agent-tool gate shared by skill authoring, the /setup turn-text rewrite,
   // the setup prompt block, and the peer-comms integration below: a driver
   // that never mounts agent tools (or a turn already at the comms-depth cap)
@@ -7037,7 +7049,7 @@ const roomHandoffTimer = setInterval(() => {
   try { roomHandoffs.tick(); } catch (error) { console.error("room handoffs:", error); }
 }, 250);
 roomHandoffTimer.unref();
-const GROUP_CONTEXT_MESSAGES = 30;
+// (the room window is now selected by bytes — see serializeRoomContext and item 0.7)
 const MAX_GROUP_HOPS = 1;
 
 type GroupMemberTurnOutcome =
@@ -7075,10 +7087,18 @@ function serializeRoomContext(
 ): string {
   const messages = store.messagesFor(threadId);
   const messagesById = new Map(messages.map((message) => [message.id, message]));
-  return messages
-    .filter((m) => (m.kind === "text" && m.text) || (m.kind === "digest" && m.digest) || m.roomRequest?.phase === "result")
-    .slice(-GROUP_CONTEXT_MESSAGES)
-    .map((m) => {
+  const compactionRecord = [...messages].reverse().find((m) => m.kind === "compaction" && m.compaction)?.compaction;
+  const entries: ReplayEntry[] = messages
+    .filter((m) => (m.kind === "text" && m.text) || (m.kind === "digest" && m.digest) || m.kind === "compaction" || m.roomRequest?.phase === "result")
+    .map((m) => ({ id: m.id, role: m.role === "user" ? "user" : "assistant", text: m.kind === "compaction" ? "" : renderRoomLine(m) }));
+  const selection = selectReplay(entries, {
+    budgetBytes: contextRebuildBytes(cfg),
+    ...(compactionRecord ? { compaction: { firstKeptId: compactionRecord.firstKeptId, summary: compactionRecord.summary } } : {}),
+  });
+  return [...selection.lead.map((l) => l.text), ...selection.transcript.filter((e) => e.text).map((e) => e.text)].join("\n");
+
+  function renderRoomLine(m: Message): string {
+    return (() => {
       if (m.kind === "digest" && m.digest) {
         return digestPromptLine(m.digest, m.from ? peerName(m.from.name) : "a bot");
       }
@@ -7101,8 +7121,8 @@ function serializeRoomContext(
       // itself.
       if (!m.peerPost || !m.from || m.from.botId === readerBotId) return line;
       return `${peerProvenanceNote({ botName: m.from.name, delivery: "post_to_room", unattended: m.peerPost.unattended })}\n${line}`;
-    })
-    .join("\n");
+    })();
+  }
 }
 
 
@@ -14650,6 +14670,44 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const fresh = botWithThread(store.bot(bot.id)!);
       broadcast({ kind: "bot", bot: fresh });
       return json(res, 201, { bot: fresh, task: wireTask(task) });
+    }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)\/compact$/);
+    if (m && method === "POST") {
+      // Item 0.7: a compaction record. The summary stands in for everything
+      // before it whenever the harness rebuilds this thread's context. A
+      // person may write the summary; otherwise the engine's one-shot text
+      // helper drafts it where the engine has one.
+      const body = await readBody(req);
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      const task = store.taskByThread(bot.id, m[2]);
+      if (!task) return json(res, 404, { error: "no such task" });
+      if (threadBusy(bot.id, task.threadId)) return json(res, 409, { error: "this thread is working — wait for it to finish" });
+      const history = store.activePath(task.threadId).filter((msg) => (msg.kind === "text" && msg.text) || (msg.kind === "digest" && msg.digest));
+      if (!history.length) return json(res, 400, { error: "nothing to summarise yet" });
+      let summary = typeof body?.summary === "string" ? body.summary.trim() : "";
+      let by: "person" | "harness" = "person";
+      if (!summary) {
+        const selection = task.modelSelection ?? bot.modelSelection;
+        const instance = registry.get(selection.instanceId);
+        if (!instance?.generateText) return json(res, 400, { error: "this engine cannot draft a summary; send one in the body as { summary }" });
+        const rendered = history.map((msg) => msg.kind === "digest" && msg.digest ? digestPromptLine(msg.digest, bot.name) : `${msg.role === "user" ? "User" : bot.name}: ${msg.text}`).join("\n");
+        summary = (await instance.generateText(
+          "Summarise the conversation below for a colleague who must continue it. Keep, verbatim, any stated constraint or decision; keep file paths, names and numbers; list what is done and what is still open. Plain prose, at most 300 words.\n\n" + rendered.slice(-60_000),
+        )).trim();
+        by = "harness";
+        if (!summary) return json(res, 502, { error: "the engine returned an empty summary" });
+      }
+      const tokensBefore = Math.ceil(history.reduce((n, msg) => n + Buffer.byteLength(msg.text ?? "", "utf8"), 0) / 4);
+      const message = runCommand({ kind: "compaction.append", key: `${task.threadId}:${history.at(-1)!.id}` }, () => {
+        const appended = store.appendMessage(task.threadId, { role: "bot", kind: "compaction", text: `[compaction] ${summary}`, compaction: { summary, firstKeptId: "", tokensBefore, by } });
+        // the record stops before itself: everything after it is kept
+        store.patchMessage(task.threadId, appended.id, { compaction: { summary, firstKeptId: appended.id, tokensBefore, by } });
+        return appended.id;
+      });
+      const fresh = botWithThread(store.bot(bot.id)!);
+      broadcast({ kind: "bot", bot: fresh });
+      return json(res, 201, { compaction: { messageId: message, summary, tokensBefore, by } });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)$/);
     if (m && method === "POST") {
