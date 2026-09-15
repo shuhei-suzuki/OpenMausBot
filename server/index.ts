@@ -49,6 +49,7 @@ import { writeTurnToken } from "./turn-token.ts";
 import { LaunchBudget, type LaunchKind, type LaunchTicket } from "./launch-budget.ts";
 import { classifyError } from "./drivers/retry.ts";
 import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest, toolEvidence } from "./digest.ts";
+import { filterCommand } from "./hooks/filters.ts";
 import { appendDecision, readDecisions, flushDecisionLog } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import {
@@ -877,7 +878,8 @@ function agentsIntegration(
 /** Engine lifecycle hooks (item 0.2): a turn-scoped bearer the engine's hook
  * helper presents on /api/internal/hook. OMB_HOOKS=0 turns the channel off. */
 const hooksEnabled = () => process.env.OMB_HOOKS !== "0";
-function hooksIntegration(botId: string, threadId: string, generation: string): { url: string; token: string } {
+function hooksIntegration(botId: string, threadId: string, generation: string): { url: string; token: string; commandFilters?: boolean } {
+  const commandFilters = store.bot(botId)?.commandFilters === true;
   const token = mintInternalCapability({
     botId,
     threadId,
@@ -888,7 +890,7 @@ function hooksIntegration(botId: string, threadId: string, generation: string): 
     createdBots: 0,
     openedThreads: 0,
   });
-  return { url: `http://127.0.0.1:${PORT}`, token };
+  return { url: `http://127.0.0.1:${PORT}`, token, ...(commandFilters ? { commandFilters } : {}) };
 }
 
 type DirectTurnDispatchClaim = {
@@ -1712,6 +1714,7 @@ async function botOverview(bot: BotRecord): Promise<BotOverview> {
       autoApprove: bot.autoApprove,
       approvalMode: approvalModeForTurn(bot),
       approvePeerComms: bot.approvePeerComms,
+      commandFilters: bot.commandFilters,
       peers: bot.peers,
       composio: bot.composio,
       browser: bot.browser,
@@ -3418,6 +3421,10 @@ const lastPromptSectionsByThread = new Map<string, Array<{ id: string; bytes: nu
 // a digest can only count activity it can attribute — so an unstamped tool
 // row is attributed to the thread's live turn instead of to nothing.
 const liveTurnByThread = new Map<string, string>();
+// Shell commands the PreToolUse filter rewrote in the turn in flight, per
+// thread; booked on the turn's usage row so /api/metrics can show whether
+// the filter earns its keep (step 9's measurement gate).
+const filteredCommandsByThread = new Map<string, number>();
 
 const TOOL_RESULTS_DIR = join(DATA_DIR, "tool-results");
 const TOOL_RESULT_SPILL_MAX = 512 * 1024;
@@ -3454,6 +3461,17 @@ function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: 
     return { ok: true, context };
   }
   if (name === "Stop") return { ok: true };
+  // PreToolUse (step 9): only ever `updatedInput` for a Bash command the
+  // filter table knows, only when the bot opted in; never a permission
+  // decision, never a block, never a rewrite of an unknown command.
+  if (name === "PreToolUse") {
+    if (payload.tool_name !== "Bash" || store.bot(capability.botId)?.commandFilters !== true) return { ok: true };
+    const toolInput = payload.tool_input && typeof payload.tool_input === "object" ? (payload.tool_input as Record<string, unknown>) : {};
+    const filtered = typeof toolInput.command === "string" ? filterCommand(toolInput.command) : null;
+    if (!filtered) return { ok: true };
+    filteredCommandsByThread.set(threadId, (filteredCommandsByThread.get(threadId) ?? 0) + 1);
+    return { ok: true, hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ...toolInput, command: filtered.command } } };
+  }
   if (name !== "PostToolUse") return { ok: true, ignored: name || "unknown" };
   const toolUseId = typeof payload.tool_use_id === "string" ? payload.tool_use_id : "";
   if (!toolUseId) return { ok: true, ignored: "PostToolUse without tool_use_id" };
@@ -4432,8 +4450,11 @@ bus.subscribe((event: RuntimeEvent) => {
         if (shape) lastPromptSectionsByThread.set(event.threadId, shape.sections);
         const startedAt = turnStartedAt.get(event.threadId);
         const settledDriverKind = registry.get(selection.instanceId)?.driverKind;
+        const filteredCommands = filteredCommandsByThread.get(event.threadId) ?? 0;
+        filteredCommandsByThread.delete(event.threadId);
         appendUsage(DATA_DIR, {
           ...(completedTurnId ? { turnId: completedTurnId } : {}),
+          ...(filteredCommands ? { filteredCommands } : {}),
           ...(startedAt ? { durationMs: Math.max(0, Date.now() - startedAt) } : {}),
           ...(completedTurnId ? { hookCoverage: coverageForDriver(settledDriverKind, toolEvidence(store.messagesFor(event.threadId), completedTurnId)) } : {}),
           ...(shape ? { promptShape: { stableBytes: shape.stableBytes, volatileBytes: shape.volatileBytes, totalBytes: shape.totalBytes, replayed: shape.replayed, replayBytes: shape.replayBytes, ...(shape.stableChanged?.length ? { stableChanged: shape.stableChanged } : {}) } } : {}),
@@ -13578,6 +13599,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 400, { error: "approvePeerComms must be true or false" });
         }
         patch.approvePeerComms = body.approvePeerComms;
+      }
+      if (body.commandFilters !== undefined) {
+        if (typeof body.commandFilters !== "boolean") {
+          return json(res, 400, { error: "commandFilters must be true or false" });
+        }
+        patch.commandFilters = body.commandFilters;
       }
       // Who this bot may contact. null clears the list back to "everyone
       // visible in my section"; an array — including an empty one — is the

@@ -281,7 +281,14 @@ export interface SendTurnInput {
      * on POST /api/internal/hook. A driver that declares `capabilities.hooks`
      * registers the helper with its engine; the harness only ever observes
      * and injects context through this channel, never decides state. */
-    hooks?: { url: string; token: string };
+    hooks?: {
+      url: string;
+      token: string;
+      /** Register the PreToolUse command filter (server/hooks/filters.ts)
+       * for this bot: known noisy shell commands are rewritten to a bounded
+       * form before they run. Never blocks; opt-in per bot. */
+      commandFilters?: boolean;
+    };
     /** Peer-agent comms: an MCP proxy (list_bots / ask_bot) that routes back
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */

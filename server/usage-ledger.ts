@@ -42,6 +42,8 @@ export interface UsageRow {
   durationMs?: number;
   /** How good the tool evidence behind the turn's digest is. */
   hookCoverage?: "full" | "preview" | "none";
+  /** Shell commands the PreToolUse filter rewrote during this turn. */
+  filteredCommands?: number;
   promptShape?: {
     stableBytes: number;
     volatileBytes: number;

@@ -390,6 +390,15 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
   probe. None of them changes correctness: a driver that later sets `structured` natively is
   re-validated by the same code. Wire them when the task object (Phase 2) makes typed turns the
   common case and 0.6 can show the token saving.
+- **F5 (Phase 1, measured by 0.6; as built in step 9): the PreToolUse command filter ships OFF
+  by default, and its measurement gate is still open.** `server/hooks/filters.ts` rewrites known
+  noisy shell commands (test runners, installs, unbounded `git log`) to a bounded form through
+  Claude Code's `updatedInput`; a bot opts in with `commandFilters: true` (PATCH /api/bots/:id),
+  and every rewrite is booked on the turn's usage row and summed as `filteredCommands` in
+  `/api/metrics`. The before/after tokens-per-task comparison the plan asks for needs a real
+  engine (the fakes report fixed token counts), so it runs with the bench driver on a live CLI
+  once step 10's baseline exists; until then the default stays off. Codex, pi and the ACP family
+  have no pre-tool hook; the flag is a Claude-driver flag and the other drivers ignore it.
 
 ## Steps (each one PR-sized, in order)
 
