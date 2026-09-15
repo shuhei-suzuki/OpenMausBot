@@ -377,6 +377,19 @@ baseline run in step 10 is executed for at least Claude, Codex and one ACP engin
   (a transcript chip) and compaction *guidance* has to travel through the CLI's own channels
   (`# Compact instructions` in the generated project instructions, or `/compact <focus>` when the
   harness triggers compaction itself in 0.7).
+- **F4 (Phase 2, task object; as built in 0.3): the native structured-output accelerators are
+  not wired yet — only the engine-agnostic baseline is.** `SendTurnInput.outputSchema` and
+  `turn.completed.structured/structuredError` exist in the contract, the harness appends the
+  instruction and validates the reply in code for every engine, and the goal-room decision is
+  schema-first on all of them (proven on fake Claude, ACP, Codex and pi). Claude `--json-schema`
+  was left out because it is a spawn argument: on a live, reused CLI process it would either
+  force a respawn per schema turn (undoing F1) or need the one-shot path on the same session id,
+  and the version floor for the flag was not verifiable offline. Codex `--output-schema` was left
+  out because it disables the schema when MCP servers are mounted (the agents tools always are).
+  OpenAI-compatible `response_format` was left out because a silent fallback needs a per-endpoint
+  probe. None of them changes correctness: a driver that later sets `structured` natively is
+  re-validated by the same code. Wire them when the task object (Phase 2) makes typed turns the
+  common case and 0.6 can show the token saving.
 
 ## Steps (each one PR-sized, in order)
 
