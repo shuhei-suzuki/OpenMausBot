@@ -138,6 +138,7 @@ function runHooks(event: string, payload: Record<string, unknown>): string {
   return stdout;
 }
 let turnsPlayed = 0;
+let sessionCostUsd = 0;
 let launchFiles: LaunchFiles | undefined;
 const argAfter = (flag: string): string | null => {
   const i = argv.indexOf(flag);
@@ -492,7 +493,9 @@ const playTurn = (prompt: JsonValue) => {
 
   const finish = () => {
     runHooks("Stop", { stop_hook_active: false });
-    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01, usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 } });
+    // like the real CLI: total_cost_usd is the session's running total
+    sessionCostUsd = Math.round((sessionCostUsd + 0.01) * 100) / 100;
+    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: sessionCostUsd, usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 } });
     turnRunning = false;
     finishIfDone();
   };
