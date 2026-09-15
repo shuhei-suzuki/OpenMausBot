@@ -1715,7 +1715,6 @@ async function botOverview(bot: BotRecord): Promise<BotOverview> {
       autoApprove: bot.autoApprove,
       approvalMode: approvalModeForTurn(bot),
       approvePeerComms: bot.approvePeerComms,
-      commandFilters: bot.commandFilters,
       peers: bot.peers,
       composio: bot.composio,
       browser: bot.browser,
